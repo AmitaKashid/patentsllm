@@ -76,10 +76,11 @@ class OllamaClient(BaseLLMClient):
             "options": {
                 "temperature": self.config.temperature,
                 "num_predict": self.config.max_new_tokens,
+                "num_ctx": self.config.num_ctx,
             },
         }
 
-        response = requests.post(url, json=payload, timeout=900)
+        response = requests.post(url, json=payload, timeout=1200)
         response.raise_for_status()
 
         data = response.json()

@@ -1,5 +1,3 @@
-# src/patentllm/generation/config.py
-
 """Configuration for LLM-based report generation."""
 
 from __future__ import annotations
@@ -21,8 +19,14 @@ class GenerationConfig:
     output_dir: Path = Path("data/processed/generated_reports")
 
     top_k: int = 8
+
+    # Conservative factual generation defaults.
     temperature: float = 0.1
-    max_new_tokens: int = 2500
+    max_new_tokens: int = 4500
+
+    # Important for evidence-pack prompts.
+    # Ollama's default context can be too small for 10-patent report generation.
+    num_ctx: int = 16000
 
     ollama_base_url: str = "http://localhost:11434"
     vllm_base_url: str = "http://localhost:8000"
