@@ -35,3 +35,8 @@ chunk["embeddable"] is True
 ```
 
 Do not embed metadata chunks as technical evidence.
+
+
+## Evaluation Reports
+
+- [Embedding Benchmark Report](docs/embedding_benchmark_report.md) — compares BGE-M3 and PatentSBERTa retrieval performance on patent-specific RAG queries.
