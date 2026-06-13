@@ -1,62 +1,37 @@
-# PatentLLM Step 1: Patent Parsing and Chunking
+# PatentLLM — Step 1 Parser v4
 
-This is the first stage of the PatentLLM system. It converts raw patent PDFs into structured JSONL files for downstream embedding, indexing, retrieval, LLM report generation, and evaluation.
+Patent-aware parsing and chunking for scanned patent PDFs.
 
-## What this stage does
+## What v4 fixes
 
-- Extracts native PDF text when available.
-- Falls back to OCR for scanned/image PDFs.
-- Preserves page-level traceability.
-- Extracts lightweight patent metadata.
-- Detects patent sections.
-- Builds paragraph records.
-- Creates RAG-ready chunks.
-- Writes a document-level quality report.
-
-## Install
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-tesseract --version
-```
+- OCR-aware PDF text extraction using PyMuPDF/Tesseract.
+- Safer metadata extraction: metadata is retained for display/filtering but is not treated as primary evidence.
+- Robust claim extraction for OCR-heavy PCT patents:
+  - ignores early cover-page references to international search reports;
+  - trims real search-report pages only after the claim block begins;
+  - keeps short claim fragments that previous paragraph filtering could drop;
+  - infers low-confidence claim 1 when OCR drops the short `1.` line;
+  - flags missing or low-confidence claims instead of silently embedding bad legal evidence.
+- Quality reports include embeddable chunk counts, detected claim numbers, missing claim numbers, and warnings.
 
 ## Run
 
-Put patent PDFs in:
+```powershell
+python scripts/parse_patents.py `
+  --input-dir data/raw/patents `
+  --output-dir data/processed/parsed_patents `
+  --ocr-dpi 240 `
+  --disable-ocr-confidence
 
-```text
-data/raw/patents/
+python scripts/audit_parser_outputs.py
 ```
 
-Then run:
+## Embed only safe chunks
 
-```bash
-python scripts/parse_patents.py \
-  --input-dir data/raw/patents \
-  --output-dir data/processed/parsed_patents \
-  --ocr-dpi 240
+Stage 2 indexing should embed only records where:
+
+```python
+chunk["embeddable"] is True
 ```
 
-For a quick smoke test:
-
-```bash
-python scripts/parse_patents.py \
-  --input-dir data/raw/patents \
-  --output-dir data/processed/parsed_patents \
-  --max-pages 2 \
-  --ocr-dpi 180
-```
-
-## Outputs
-
-```text
-data/processed/parsed_patents/documents.jsonl
-data/processed/parsed_patents/pages.jsonl
-data/processed/parsed_patents/paragraphs.jsonl
-data/processed/parsed_patents/chunks.jsonl
-data/processed/parsed_patents/quality_report.jsonl
-```
-
-Embed `chunks.jsonl` in the next stage. Review `quality_report.jsonl` before indexing.
+Do not embed metadata chunks as technical evidence.

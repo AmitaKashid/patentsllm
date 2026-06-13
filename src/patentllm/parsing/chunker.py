@@ -1,4 +1,11 @@
-"""Patent-aware chunking."""
+"""Patent-aware chunking.
+
+This chunker is deliberately conservative:
+- claims are extracted through a dedicated defensive extractor;
+- metadata is kept as a non-embeddable filter chunk unless explicitly used later;
+- table/figure-heavy OCR text is flagged so it does not silently pollute RAG evidence;
+- legal/semantic boundaries use zero overlap; overlap is used only for forced splits.
+"""
 
 from __future__ import annotations
 
@@ -6,13 +13,24 @@ import hashlib
 import re
 from collections import defaultdict
 
+from patentllm.parsing.claim_extraction import ClaimExtractionResult, ExtractedClaim, extract_claims_from_paragraphs
 from patentllm.parsing.config import PatentParserConfig
 from patentllm.parsing.models import ParagraphRecord, PatentChunk, PatentMetadata
 from patentllm.parsing.section_detection import is_evidence_section
 from patentllm.parsing.text_cleaning import estimate_tokens, normalize_inline_spacing
+from patentllm.parsing.text_quality import assess_text_quality
 
-_CLAIM_START_RE = re.compile(r"^\s*(?P<number>\d{1,3})\s*[\.)]\s+(?P<body>.+)", flags=re.DOTALL)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;:])\s+(?=[A-Z0-9\(])")
+_EMBEDDABLE_CHILD_TYPES = {
+    "claim",
+    "claim_clause_window",
+    "description_paragraph_window",
+    "description_paragraph_window_forced_split",
+    "evidence_paragraph_window",
+    "evidence_paragraph_window_forced_split",
+    "title_abstract_claims",
+}
+_NON_EMBEDDABLE_SECTIONS = {"front_page", "search_report", "metadata"}
 
 
 class PatentChunker:
@@ -20,6 +38,7 @@ class PatentChunker:
 
     def __init__(self, config: PatentParserConfig) -> None:
         self.config = config
+        self.last_claim_extraction: ClaimExtractionResult | None = None
 
     def build_chunks(
         self,
@@ -43,18 +62,20 @@ class PatentChunker:
 
     def _metadata_chunk(self, metadata: PatentMetadata) -> PatentChunk:
         lines = [
-            "Patent metadata",
+            "Patent metadata (not primary evidence)",
             f"Publication number: {metadata.publication_number or 'unknown'}",
             f"Kind code: {metadata.kind_code or 'unknown'}",
             f"Title: {metadata.title or 'unknown'}",
-            f"Applicant: {metadata.applicant or 'unknown'}",
-            f"Inventors: {metadata.inventors or 'unknown'}",
-            f"Publication date: {metadata.publication_date or 'unknown'}",
             f"Application number: {metadata.application_number or 'unknown'}",
+            f"Publication date: {metadata.publication_date or 'unknown'}",
             f"Filing date: {metadata.filing_date or 'unknown'}",
             f"Priority date: {metadata.priority_date or 'unknown'}",
             f"Classifications: {', '.join(metadata.ipc_cpc_classifications) if metadata.ipc_cpc_classifications else 'unknown'}",
         ]
+        if metadata.applicant:
+            lines.append(f"Applicant: {metadata.applicant}")
+        if metadata.inventors:
+            lines.append(f"Inventors: {metadata.inventors}")
         if metadata.abstract:
             lines.append(f"Abstract: {metadata.abstract}")
         if metadata.cited_patent_literature:
@@ -74,7 +95,12 @@ class PatentChunker:
             page_end=1,
             paragraph_ids=[],
             source_page_numbers=[1],
-            extra_metadata={"overlap_tokens": 0},
+            extra_metadata={
+                "overlap_tokens": 0,
+                "embeddable_reason": "Metadata is a filter/display record, not primary technical evidence.",
+                "metadata_warnings": metadata.metadata_warnings,
+            },
+            force_embeddable=False,
         )
 
     def _title_abstract_claims_chunk(
@@ -82,21 +108,34 @@ class PatentChunker:
         metadata: PatentMetadata,
         claim_chunks: list[PatentChunk],
     ) -> PatentChunk | None:
-        parts = [f"Title: {metadata.title or ''}".strip()]
+        parts = [f"Title: {metadata.title}" if metadata.title else ""]
         if metadata.abstract:
             parts.append(f"Abstract: {metadata.abstract}")
 
-        for claim_chunk in claim_chunks:
-            candidate = "\n\n".join(parts + [f"Claim evidence: {claim_chunk.text}"])
+        # Prefer independent claim 1 and then early claims. Avoid noisy low-confidence claim chunks.
+        selected_claims = [
+            chunk
+            for chunk in claim_chunks
+            if chunk.metadata.get("claim_confidence") in {"high", "medium"}
+            and chunk.metadata.get("claim_window_index", 0) == 0
+        ]
+        selected_claims.sort(key=lambda chunk: int(chunk.metadata.get("claim_number") or 999))
+
+        included = 0
+        for claim_chunk in selected_claims:
+            claim_number = claim_chunk.metadata.get("claim_number")
+            label = f"Claim {claim_number}" if claim_number is not None else "Claim evidence"
+            candidate = "\n\n".join(part for part in parts + [f"{label}: {claim_chunk.text}"] if part.strip())
             if estimate_tokens(candidate) > self.config.tac_max_tokens:
                 break
-            parts.append(f"Claim evidence: {claim_chunk.text}")
+            parts.append(f"{label}: {claim_chunk.text}")
+            included += 1
 
         text = "\n\n".join(part for part in parts if part.strip())
         if not text.strip():
             return None
 
-        pages = sorted({1, *[p for c in claim_chunks for p in c.source_page_numbers]})
+        pages = sorted({1, *[p for c in selected_claims[:included] for p in c.source_page_numbers]})
         return self._make_chunk(
             metadata=metadata,
             section="title_abstract_claims",
@@ -105,9 +144,9 @@ class PatentChunker:
             text=text,
             page_start=min(pages) if pages else 1,
             page_end=max(pages) if pages else 1,
-            paragraph_ids=[pid for c in claim_chunks for pid in c.paragraph_ids],
+            paragraph_ids=[pid for c in selected_claims[:included] for pid in c.paragraph_ids],
             source_page_numbers=pages or [1],
-            extra_metadata={"overlap_tokens": 0, "claim_count_included": len(claim_chunks)},
+            extra_metadata={"overlap_tokens": 0, "claim_count_included": included},
         )
 
     def _claim_chunks(
@@ -116,77 +155,66 @@ class PatentChunker:
         paragraphs: list[ParagraphRecord],
     ) -> list[PatentChunk]:
         claim_paragraphs = [p for p in paragraphs if p.section == "claims"]
-        if not claim_paragraphs:
+        extraction = extract_claims_from_paragraphs(claim_paragraphs)
+        self.last_claim_extraction = extraction
+        if not extraction.claims:
             return []
 
-        claims = self._split_claims(claim_paragraphs)
         chunks: list[PatentChunk] = []
-
-        for claim_number, claim_text, claim_paragraph_ids, pages in claims:
-            if estimate_tokens(claim_text) <= self.config.claim_max_tokens:
-                chunks.append(
-                    self._make_chunk(
-                        metadata=metadata,
-                        section="claims",
-                        chunk_type="claim",
-                        retrieval_tier="child",
-                        text=claim_text,
-                        page_start=min(pages),
-                        page_end=max(pages),
-                        paragraph_ids=claim_paragraph_ids,
-                        source_page_numbers=sorted(set(pages)),
-                        extra_metadata={"claim_number": claim_number, "overlap_tokens": 0},
-                    )
-                )
-            else:
-                chunks.extend(
-                    self._forced_text_windows(
-                        metadata=metadata,
-                        section="claims",
-                        chunk_type="claim_clause_window",
-                        retrieval_tier="child",
-                        text=claim_text,
-                        max_tokens=self.config.claim_max_tokens,
-                        overlap_tokens=self.config.forced_split_overlap_tokens,
-                        paragraph_ids=claim_paragraph_ids,
-                        source_page_numbers=pages,
-                        extra_metadata={"claim_number": claim_number},
-                    )
-                )
+        for claim in extraction.claims:
+            chunks.extend(self._chunks_for_claim(metadata, claim))
         return chunks
 
-    def _split_claims(
-        self,
-        claim_paragraphs: list[ParagraphRecord],
-    ) -> list[tuple[int | None, str, list[str], list[int]]]:
-        combined = "\n".join(p.text for p in claim_paragraphs)
-        starts = list(re.finditer(r"(?m)^\s*(\d{1,3})\s*[\.)]\s+", combined))
+    def _chunks_for_claim(self, metadata: PatentMetadata, claim: ExtractedClaim) -> list[PatentChunk]:
+        pages = sorted(set(claim.page_numbers)) or [None]
+        extra = {
+            "claim_number": claim.claim_number,
+            "claim_confidence": claim.confidence,
+            "claim_warnings": claim.warnings,
+            "overlap_tokens": 0,
+        }
 
-        if not starts:
+        if estimate_tokens(claim.text) <= self.config.claim_max_tokens:
             return [
-                (
-                    None,
-                    normalize_inline_spacing(combined),
-                    [p.paragraph_id for p in claim_paragraphs],
-                    [p.page_number for p in claim_paragraphs],
+                self._make_chunk(
+                    metadata=metadata,
+                    section="claims",
+                    chunk_type="claim",
+                    retrieval_tier="child",
+                    text=claim.text,
+                    page_start=min(p for p in pages if p is not None),
+                    page_end=max(p for p in pages if p is not None),
+                    paragraph_ids=claim.paragraph_ids,
+                    source_page_numbers=[p for p in pages if p is not None],
+                    extra_metadata=extra,
                 )
             ]
 
-        claims: list[tuple[int | None, str, list[str], list[int]]] = []
-        for idx, start in enumerate(starts):
-            end = starts[idx + 1].start() if idx + 1 < len(starts) else len(combined)
-            raw = combined[start.start() : end]
-            match = _CLAIM_START_RE.match(raw.strip())
-            claim_number = int(match.group("number")) if match else None
-            claims.append(
-                (
-                    claim_number,
-                    normalize_inline_spacing(raw),
-                    [p.paragraph_id for p in claim_paragraphs],
-                    [p.page_number for p in claim_paragraphs],
-                )
+        windows = self._forced_text_windows(
+            metadata=metadata,
+            section="claims",
+            chunk_type="claim_clause_window",
+            retrieval_tier="child",
+            text=claim.text,
+            max_tokens=self.config.claim_max_tokens,
+            overlap_tokens=self.config.forced_split_overlap_tokens,
+            paragraph_ids=claim.paragraph_ids,
+            source_page_numbers=[p for p in pages if p is not None],
+            extra_metadata=extra,
+        )
+        return [
+            self._replace_chunk_metadata(
+                chunk,
+                {
+                    **chunk.metadata,
+                    "claim_window_index": chunk.metadata.get("window_index", 0),
+                    "claim_number": claim.claim_number,
+                    "claim_confidence": claim.confidence,
+                    "claim_warnings": claim.warnings,
+                },
             )
-        return claims
+            for chunk in windows
+        ]
 
     def _paragraph_window_chunks(
         self,
@@ -295,7 +323,7 @@ class PatentChunker:
     ) -> list[PatentChunk]:
         grouped: dict[str, list[PatentChunk]] = defaultdict(list)
         for chunk in child_chunks:
-            if chunk.retrieval_tier == "child":
+            if chunk.retrieval_tier == "child" and chunk.embeddable:
                 grouped[chunk.section].append(chunk)
 
         parents: list[PatentChunk] = []
@@ -402,8 +430,31 @@ class PatentChunker:
         paragraph_ids: list[str],
         source_page_numbers: list[int],
         extra_metadata: dict[str, object] | None = None,
+        force_embeddable: bool | None = None,
     ) -> PatentChunk:
         clean_text = normalize_inline_spacing(text.replace("\n", " \n ")).replace(" \n ", "\n")
+        quality = assess_text_quality(clean_text)
+        quality_flags = quality.flags()
+
+        embeddable = chunk_type in _EMBEDDABLE_CHILD_TYPES and section not in _NON_EMBEDDABLE_SECTIONS
+        if quality.is_suspicious_ocr and quality.table_detected:
+            embeddable = False
+            quality_flags.append("excluded_from_embedding_due_to_table_ocr_noise")
+        if chunk_type == "metadata":
+            embeddable = False
+        if force_embeddable is not None:
+            embeddable = force_embeddable
+
+        extra = dict(extra_metadata or {})
+        extra.update(
+            {
+                "weird_character_ratio": round(quality.weird_character_ratio, 4),
+                "table_detected": quality.table_detected,
+                "figure_detected": quality.figure_detected,
+                "quality_flags": quality_flags,
+            }
+        )
+
         chunk_id = _stable_chunk_id(metadata.document_id, section, chunk_type, clean_text, page_start, page_end)
         return PatentChunk(
             chunk_id=chunk_id,
@@ -420,7 +471,31 @@ class PatentChunker:
             token_estimate=estimate_tokens(clean_text),
             paragraph_ids=paragraph_ids,
             source_page_numbers=source_page_numbers,
-            metadata=dict(extra_metadata or {}),
+            metadata=extra,
+            embeddable=embeddable,
+            quality_flags=quality_flags,
+        )
+
+    @staticmethod
+    def _replace_chunk_metadata(chunk: PatentChunk, metadata: dict[str, object]) -> PatentChunk:
+        return PatentChunk(
+            chunk_id=chunk.chunk_id,
+            document_id=chunk.document_id,
+            source_file=chunk.source_file,
+            publication_number=chunk.publication_number,
+            title=chunk.title,
+            section=chunk.section,
+            chunk_type=chunk.chunk_type,
+            retrieval_tier=chunk.retrieval_tier,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
+            text=chunk.text,
+            token_estimate=chunk.token_estimate,
+            paragraph_ids=chunk.paragraph_ids,
+            source_page_numbers=chunk.source_page_numbers,
+            metadata=metadata,
+            embeddable=chunk.embeddable,
+            quality_flags=chunk.quality_flags,
         )
 
 
