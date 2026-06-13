@@ -31,6 +31,10 @@ from patentllm.generation.section_prompts import (
     SectionSpec,
     build_section_prompt,
 )
+from patentllm.generation.patent_key import (
+    append_or_replace_patent_key,
+    build_patent_key_markdown,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         help="Continue generating later sections even if one section fails.",
     )
 
+    parser.add_argument(
+        "--metadata-csv",
+        type=Path,
+        default=Path("data/reference/patent_metadata.csv"),
+    )
     return parser.parse_args()
 
 
@@ -212,6 +221,16 @@ def main() -> None:
 
     final_report_path = run_dir / f"final_report_{spec.safe_name}.md"
     assemble_report(generated_sections, final_report_path)
+
+    report_text = final_report_path.read_text(encoding="utf-8")
+    patent_key = build_patent_key_markdown(
+        evidence_pack=evidence_pack,
+        metadata_csv_path=args.metadata_csv,
+    )
+    final_report_path.write_text(
+        append_or_replace_patent_key(report_text, patent_key),
+        encoding="utf-8",
+    )
 
     write_summary_csv(records, run_dir / "section_generation_summary.csv")
     write_summary_jsonl(records, run_dir / "section_generation_summary.jsonl")
