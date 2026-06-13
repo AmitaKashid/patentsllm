@@ -91,6 +91,7 @@ def main() -> None:
         check_citation_validity(report_text, valid_evidence_ids),
         check_forbidden_legal_terms(report_text),
         check_patent_key_rows(report_text),
+        check_patent_key_artifacts(report_text),
     ]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +208,44 @@ def write_markdown(
             detail = result.detail.replace("|", "\\|")
             file.write(f"| {result.check} | {result.passed} | {detail} |\n")
 
+
+def check_patent_key_artifacts(report_text: str) -> AuditResult:
+    """Check that the report has exactly one clean patent-key section."""
+
+    heading_matches = re.findall(
+        r"##\s+Patent\s+key\s+and\s+extracted\s+R&D\s+signal",
+        report_text,
+        flags=re.IGNORECASE,
+    )
+
+    malformed_header_matches = re.findall(
+        r"(?m)^#\s*\|\s*Patent\s*\|\s*Owner\s*\|\s*Priority\s*\|",
+        report_text,
+        flags=re.IGNORECASE,
+    )
+
+    malformed_row_matches = re.findall(
+        r"(?m)^#\s*\|\s*EP\d+",
+        report_text,
+        flags=re.IGNORECASE,
+    )
+
+    problems: list[str] = []
+
+    if len(heading_matches) != 1:
+        problems.append(f"Expected exactly 1 patent-key heading, found {len(heading_matches)}.")
+
+    if malformed_header_matches:
+        problems.append("Found malformed patent-key header starting with '# | Patent | ...'.")
+
+    if malformed_row_matches:
+        problems.append(f"Found {len(malformed_row_matches)} malformed patent-key rows starting with '# | EP...'.")
+
+    return AuditResult(
+        check="patent_key_artifacts",
+        passed=not problems,
+        detail="Exactly one clean patent-key section found." if not problems else " ".join(problems),
+    )
 
 if __name__ == "__main__":
     main()
