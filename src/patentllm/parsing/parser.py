@@ -15,10 +15,7 @@ from patentllm.parsing.section_detection import detect_section_heading
 from patentllm.parsing.text_cleaning import estimate_tokens, join_wrapped_lines, normalize_inline_spacing
 
 _PARAGRAPH_MARKER_RE = re.compile(r"^\s*(?P<marker>\[?\d{4}\]?)\s*(?P<body>.*)$")
-_FORMAL_CLAIM_HEADING_RE = re.compile(
-    r"\b(?:CLAIMS?|WE CLAIM|I/WE CLAIM|WHAT IS CLAIMED)\b\s*:?",
-    flags=re.IGNORECASE,
-)
+
 
 class PatentPdfParser:
     """Parse patent PDFs into structured metadata, pages, paragraphs, chunks, and quality records."""
@@ -85,7 +82,16 @@ class PatentPdfParser:
             nonlocal buffer, marker, sequence_index
             text = join_wrapped_lines(buffer)
             buffer = []
-            if not text or len(text) < self.config.min_paragraph_chars:
+            keep_short_claim_fragment = (
+                section == "claims"
+                and bool(text)
+                and (
+                    bool(re.match(r"^\s*\d{1,3}\s*[\.)]", text))
+                    or bool(re.search(r"\b(?:comprising|wherein|according to claim|Claim \d+|A hot melt adhesive|A composition|A method)\b", text, flags=re.IGNORECASE))
+                    or text.startswith(("(A)", "(B)", "(C)", "(D)", "(f)", "(g)", "(h)", "(i)", "(j)"))
+                )
+            )
+            if not text or (len(text) < self.config.min_paragraph_chars and not keep_short_claim_fragment):
                 marker = None
                 return
 
@@ -143,62 +149,145 @@ class PatentPdfParser:
         marker_part = marker if marker else f"seq{sequence_index:05d}"
         return f"{document_id}:p{page_number}:{marker_part}"
     
-
     def _repair_missing_claim_section(
         self,
         pages: list[PageRecord],
         paragraphs: list[ParagraphRecord],
     ) -> list[ParagraphRecord]:
-        """Repair missed claim sections caused by OCR heading variants.
+        """Recover claim sections when OCR misses the formal CLAIMS heading.
 
-        Some patent PDFs use headings such as "We claim:" or "What is Claimed:"
-        instead of a clean "CLAIMS" heading. OCR can also attach those headings
-        to page headers. If no claims were detected, scan the final part of the
-        document for a formal claim heading and reclassify later body paragraphs
-        as claims.
+        Some scanned PCT PDFs do not expose a clean "CLAIMS" heading after OCR.
+        In those cases, the parser may classify late claim paragraphs as
+        detailed_description. This method repairs only that situation.
 
-        This is intentionally conservative:
-        - It only runs when no claims section was detected.
-        - It only searches the later part of the document.
-        - It does not overwrite search-report or citation-list sections.
+        Rules:
+        - If claim paragraphs already exist, return unchanged.
+        - Look for late pages containing "We claim" / "Claims" / numbered claim starts.
+        - Mark matching paragraphs on those pages as claims.
+        - Stop before the International Search Report.
         """
 
         if any(paragraph.section == "claims" for paragraph in paragraphs):
             return paragraphs
 
-        claim_start_page = self._find_formal_claim_start_page(pages)
-        if claim_start_page is None:
+        claim_page_numbers = self._detect_claim_page_numbers(pages)
+        if not claim_page_numbers:
             return paragraphs
 
         repaired: list[ParagraphRecord] = []
-        protected_sections = {"search_report", "citation_list"}
+        claim_mode = False
 
         for paragraph in paragraphs:
-            if (
-                paragraph.page_number >= claim_start_page
-                and paragraph.section not in protected_sections
-            ):
-                repaired.append(replace(paragraph, section="claims"))
-            else:
+            if paragraph.page_number not in claim_page_numbers:
                 repaired.append(paragraph)
+                continue
+
+            text = paragraph.text.strip()
+
+            if self._is_search_report_text(text):
+                claim_mode = False
+                repaired.append(paragraph)
+                continue
+
+            if self._looks_like_claim_start(text):
+                claim_mode = True
+                repaired.append(replace(paragraph, section="claims"))
+                continue
+
+            if claim_mode and self._looks_like_claim_continuation(text):
+                repaired.append(replace(paragraph, section="claims"))
+                continue
+
+            repaired.append(paragraph)
 
         return repaired
 
     @staticmethod
-    def _find_formal_claim_start_page(pages: list[PageRecord]) -> int | None:
-        """Find the first late-document page containing a formal claim heading."""
+    def _detect_claim_page_numbers(pages: list[PageRecord]) -> set[int]:
+        """Detect likely claim pages from page-level OCR text."""
 
-        if not pages:
-            return None
-
-        total_pages = max(page.page_number for page in pages)
-        search_from_page = max(1, int(total_pages * 0.55))
+        claim_pages: set[int] = set()
 
         for page in pages:
-            if page.page_number < search_from_page:
+            text = page.text or ""
+            lowered = text.lower()
+
+            if "international search report" in lowered:
                 continue
 
-            if _FORMAL_CLAIM_HEADING_RE.search(page.text):
-                return page.page_number
+            has_claim_heading = (
+                "we claim" in lowered
+                or "\nclaims\n" in lowered
+                or lowered.strip().startswith("claims")
+            )
+            has_numbered_claim = bool(
+                re.search(
+                    r"(?:^|\n|\s)(?:1|2|3)\s*[\.)]\s+"
+                    r"(?:a|an|the|use|method|composition|adhesive|laminate|article)\b",
+                    lowered,
+                    flags=re.IGNORECASE,
+                )
+            )
 
-        return None
+            if has_claim_heading or has_numbered_claim:
+                claim_pages.add(page.page_number)
+
+        return claim_pages
+
+    @staticmethod
+    def _looks_like_claim_start(text: str) -> bool:
+        """Return True if a paragraph looks like the start of a patent claim."""
+
+        normalized = " ".join(text.split())
+        return bool(
+            re.match(
+                r"^\s*\d{1,3}\s*[\.)]\s+"
+                r"(?:A|An|The|Use|Method|Composition|Adhesive|Laminate|Article)\b",
+                normalized,
+            )
+        )
+
+    @staticmethod
+    def _looks_like_claim_continuation(text: str) -> bool:
+        """Return True if a paragraph likely continues a previous claim."""
+
+        normalized = " ".join(text.split())
+        if not normalized:
+            return False
+
+        if re.match(r"^\s*\d{1,3}\s*[\.)]\s+", normalized):
+            return False
+
+        continuation_markers = (
+            "wherein",
+            "comprising",
+            "consisting",
+            "selected from",
+            "about",
+            "from",
+            "and",
+            "or",
+            "(a)",
+            "(b)",
+            "(c)",
+            "(d)",
+            "(e)",
+            "(f)",
+            "(g)",
+            "(h)",
+            "(i)",
+            "(j)",
+        )
+
+        return normalized.lower().startswith(continuation_markers)
+
+    @staticmethod
+    def _is_search_report_text(text: str) -> bool:
+        """Return True if text belongs to the International Search Report."""
+
+        lowered = text.lower()
+        return (
+            "international search report" in lowered
+            or "documents considered to be relevant" in lowered
+            or "form pct/isa/210" in lowered
+        )

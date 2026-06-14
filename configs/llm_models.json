@@ -1,0 +1,34 @@
+{
+  "models": [
+    {
+      "id": "qwen3_8b_ollama",
+      "backend": "ollama",
+      "model_name": "qwen3:8b",
+      "enabled": true
+    },
+    {
+      "id": "llama31_8b_ollama",
+      "backend": "ollama",
+      "model_name": "llama3.1:8b",
+      "enabled": true
+    },
+    {
+      "id": "mistral_7b_ollama",
+      "backend": "ollama",
+      "model_name": "mistral:7b",
+      "enabled": true
+    },
+    {
+      "id": "qwen3_8b_transformers",
+      "backend": "transformers",
+      "model_name": "Qwen/Qwen3-8B",
+      "enabled": false
+    },
+    {
+      "id": "qwen3_8b_vllm",
+      "backend": "vllm",
+      "model_name": "Qwen/Qwen3-8B",
+      "enabled": false
+    }
+  ]
+}

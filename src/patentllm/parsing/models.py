@@ -10,7 +10,12 @@ JsonDict = dict[str, Any]
 
 @dataclass(frozen=True, slots=True)
 class PatentMetadata:
-    """Document-level metadata extracted from filename, cover page, and body text."""
+    """Document-level metadata extracted from filename, cover page, and body text.
+
+    Metadata from scanned PCT cover pages is intentionally treated as opportunistic:
+    publication number, title, abstract, and classifications are usually useful;
+    applicant/inventor/date fields can be None when cover-page OCR is too noisy.
+    """
 
     document_id: str
     source_file: str
@@ -30,6 +35,7 @@ class PatentMetadata:
     detected_tables: list[str] = field(default_factory=list)
     detected_figures: list[str] = field(default_factory=list)
     raw_cover_fields: dict[str, str] = field(default_factory=dict)
+    metadata_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -89,6 +95,8 @@ class PatentChunk:
     paragraph_ids: list[str] = field(default_factory=list)
     source_page_numbers: list[int] = field(default_factory=list)
     metadata: JsonDict = field(default_factory=dict)
+    embeddable: bool = True
+    quality_flags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> JsonDict:
         return asdict(self)
@@ -108,13 +116,19 @@ class ParseQualityReport:
     low_confidence_ocr_pages: list[int]
     paragraph_count: int
     chunk_count: int
+    embeddable_chunk_count: int
     detected_sections: list[str]
     title_found: bool
     abstract_found: bool
     claims_found: bool
+    claim_count: int
+    claim_numbers_detected: list[int]
+    missing_claim_numbers: list[int]
+    low_confidence_claim_count: int
     examples_found: bool
     tables_detected: bool
     figures_detected: bool
+    suspicious_chunk_count: int
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> JsonDict:
