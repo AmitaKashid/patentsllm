@@ -20,3 +20,24 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Raw and generated data
+data/raw/patents/*
+data/processed/*
+
+# Keep folder structure
+!data/raw/patents/.gitkeep
+!data/processed/.gitkeep
+
+# Keep small reproducibility metadata
+!data/reference/
+!data/reference/patent_metadata.csv
+
+# Vector stores and heavy generated artifacts
+data/processed/vector_store/
+data/processed/chroma/
+*.sqlite3
+*.parquet
+*.pkl
+*.bin
+*.onnx
