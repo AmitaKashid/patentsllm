@@ -40,3 +40,24 @@ Do not embed metadata chunks as technical evidence.
 ## Evaluation Reports
 
 - [Embedding Benchmark Report](docs/embedding_benchmark_report.md) — compares BGE-M3 and PatentSBERTa retrieval performance on patent-specific RAG queries.
+
+## Current Status
+
+The project currently implements an end-to-end patent report-generation pipeline:
+
+- patent PDF parsing and section-aware chunking
+- embedding and vector indexing
+- evidence-pack construction
+- refined patent-card generation
+- repaired patent-card validation
+- atomic claim-bank construction
+- claim-bank-grounded report generation
+- deterministic table repair
+- structural and claim-bank alignment audits
+
+The final accepted report architecture is **claim-bank + deterministic tables**. This architecture was selected because the claim-bank alignment audit showed that all 55 checked report rows were aligned or partially aligned with approved claim-bank items.
+
+See:
+- `docs/architecture/pipeline_design.md`
+- `docs/results/final_claim_bank_grounded_report.md`
+- `docs/results/claim_bank_alignment_summary.md`
